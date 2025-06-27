@@ -1,0 +1,40 @@
+//in progress, doesn't work yet
+
+import dotenv from 'dotenv';
+dotenv.config();
+
+import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
+import bs58 from 'bs58';
+
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT || '';
+const OUTPUT_MINT = process.env.OUTPUT_MINT || '';
+const LIQUIDATION_WALLETS = (process.env.LIQUIDATION_WALLETS || '').split(',');
+
+if (!RPC_ENDPOINT || !OUTPUT_MINT || LIQUIDATION_WALLETS.length !== 5) {
+  console.error('Missing or invalid .env configuration');
+  process.exit(1);
+}
+
+const connection = new Connection(RPC_ENDPOINT, 'confirmed');
+
+async function checkBalances() {
+  for (const key of LIQUIDATION_WALLETS) {
+    try {
+      const keypair = Keypair.fromSecretKey(bs58.decode(key));
+      const solBalance = await connection.getBalance(keypair.publicKey);
+      console.log(`Wallet ${keypair.publicKey.toBase58()}: ${solBalance / 1e9} SOL`);
+      try {
+        const tokenAccount = await getAssociatedTokenAddress(new PublicKey(OUTPUT_MINT), keypair.publicKey);
+        const tokenInfo = await getAccount(connection, tokenAccount);
+        console.log(`  Token ${OUTPUT_MINT}: ${Number(tokenInfo.amount)}`);
+      } catch (e) {
+        console.log(`  No tokens for ${OUTPUT_MINT}: ${e.message}`);
+      }
+    } catch (e) {
+      console.error(`Invalid private key: ${e.message}`);
+    }
+  }
+}
+
+checkBalances().catch(console.error);
