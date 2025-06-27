@@ -1,0 +1,160 @@
+import { Connection, Keypair, VersionedTransaction, PublicKey } from '@solana/web3.js';
+import * as dotenv from 'dotenv';
+import bs58 from 'bs58';
+import fetch from 'node-fetch';
+import { getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
+
+dotenv.config();
+
+const JUPITER_QUOTE_API = 'https://jupiter-swap-lb.solanatracker.io/jupiter/quote';
+const JUPITER_SWAP_API = `https://jupiter-swap-lb.solanatracker.io/jupiter/swap?api_key=${process.env.JUPITER_API_KEY}`;
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '';
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT || '';
+const SLIPPAGE_BPS = parseInt(process.env.SLIPPAGE_BPS || '1000');
+const INPUT_MINT = 'So11111111111111111111111111111111111111112';
+const OUTPUT_MINT = process.env.OUTPUT_MINT!;
+const WALLET_KEYS = (process.env.WALLET_KEYS || '').split(',');
+const MIN_AMOUNT = parseInt(process.env.MIN_SWAP_AMOUNT!);
+const MAX_AMOUNT = parseInt(process.env.MAX_SWAP_AMOUNT!);
+const MIN_PAUSE_MS = parseInt(process.env.PAUSE_MS || '1000');
+const MAX_PAUSE_MS = MIN_PAUSE_MS * 2;
+const PRIORITY_FEE_LAMPORTS = parseInt(process.env.PRIORITY_FEE_LAMPORTS || '100000');
+const ROUND_SPEED = (process.env.ROUND_SPEED || 'fast').toLowerCase();
+
+const getRoundDelay = () => {
+    if (ROUND_SPEED === 'low') return Math.floor(Math.random() * (300000 - 180000) + 180000);
+    if (ROUND_SPEED === 'medium') return Math.floor(Math.random() * (90000 - 60000) + 60000);
+    return 30000;
+};
+
+const randomAmount = () => Math.floor(Math.random() * (MAX_AMOUNT - MIN_AMOUNT) + MIN_AMOUNT);
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const lamportsToSol = (lamports: number) => lamports / 1e9;
+const msToSeconds = (ms: number) => Math.floor(ms / 1000);
+
+const shuffle = <T>(array: T[]): T[] => {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+};
+
+const getQuote = async (inputMint: string, outputMint: string, amount: number) => {
+    const url = `${JUPITER_QUOTE_API}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${SLIPPAGE_BPS}&dexes=Meteora&api_key=${JUPITER_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Quote error: ${res.status} - ${text}`);
+    }
+    return res.json();
+};
+
+const getSwapTransaction = async (quote: any, pubkey: string) => {
+    const body = {
+        quoteResponse: quote,
+        userPublicKey: pubkey,
+        wrapAndUnwrapSol: true,
+        prioritizationFeeLamports: PRIORITY_FEE_LAMPORTS
+    };
+    const res = await fetch(JUPITER_SWAP_API, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Swap error: ${res.status} - ${text}`);
+    }
+    const data = await res.json();
+    if (!data.swapTransaction) {
+        throw new Error(`No swapTransaction found.`);
+    }
+    return data.swapTransaction;
+};
+
+const signAndSendTransaction = async (serializedTx: string, keypair: Keypair, connection: Connection) => {
+    const txBuffer = Buffer.from(serializedTx, 'base64');
+    const transaction = VersionedTransaction.deserialize(txBuffer);
+    transaction.sign([keypair]);
+    const signature = await connection.sendTransaction(transaction, { skipPreflight: true });
+    await connection.confirmTransaction(signature, 'finalized');
+    return signature;
+};
+
+const main = async () => {
+    const connection = new Connection(RPC_ENDPOINT, 'confirmed');
+
+    while (true) {
+        const shuffledKeys = shuffle([...WALLET_KEYS]);
+        const completedWallets: { keypair: Keypair, pubkey: string }[] = [];
+
+        for (const key of shuffledKeys) {
+            const keypair = Keypair.fromSecretKey(bs58.decode(key));
+            const pubkey = keypair.publicKey.toBase58();
+
+            for (let i = 0; i < 2; i++) {
+                const amount = randomAmount();
+                console.log(`\nWallet: ${pubkey} | Buy ${i + 1}: ${lamportsToSol(amount)} SOL`);
+                try {
+                    const balance = await connection.getBalance(keypair.publicKey);
+                    if (balance < amount + 105000) {
+                        console.warn(`⚠️ Skipping buy for ${pubkey}, low balance`);
+                        continue;
+                    }
+                    const quote = await getQuote(INPUT_MINT, OUTPUT_MINT, amount);
+                    const tx = await getSwapTransaction(quote, pubkey);
+                    const sig = await signAndSendTransaction(tx, keypair, connection);
+                    console.log(`✅ Buy ${i + 1} complete: ${sig}`);
+                    await sleep(Math.floor(Math.random() * (MAX_PAUSE_MS - MIN_PAUSE_MS) + MIN_PAUSE_MS));
+                } catch (e) {
+                    if (e instanceof Error) {
+                        console.error(`❌ Buy failed for ${pubkey}:`, e.message);
+                    } else {
+                        console.error(`❌ Buy failed for ${pubkey}:`, String(e));
+                    }
+                }
+            }
+
+            completedWallets.push({ keypair, pubkey });
+        }
+
+        for (const { keypair, pubkey } of shuffle([...completedWallets])) {
+            try {
+                const tokenAccount = await getAssociatedTokenAddress(new PublicKey(OUTPUT_MINT), keypair.publicKey);
+                const tokenInfo = await getAccount(connection, tokenAccount);
+                const sellAmount = Math.floor(Number(tokenInfo.amount) * 0.9);
+                if (sellAmount === 0) {
+                    console.log(`⚠️ No tokens to sell for ${pubkey}`);
+                    continue;
+                }
+                console.log(`\nWallet: ${pubkey} | Selling 90% (${sellAmount} units)`);
+                const quote = await getQuote(OUTPUT_MINT, INPUT_MINT, sellAmount);
+                const tx = await getSwapTransaction(quote, pubkey);
+                const sig = await signAndSendTransaction(tx, keypair, connection);
+                console.log(`✅ Sell complete: ${sig}`);
+            } catch (e) {
+                if (e instanceof Error) {
+                    console.error(`❌ Sell failed for ${pubkey}:`, e.message);
+                } else {
+                    console.error(`❌ Sell failed for ${pubkey}:`, String(e));
+                }
+            }
+            await sleep(Math.floor(Math.random() * (MAX_PAUSE_MS - MIN_PAUSE_MS) + MIN_PAUSE_MS));
+        }
+
+        const roundDelay = getRoundDelay();
+        console.log(`\n🔁 Waiting ${msToSeconds(roundDelay)}s before next round...\n`);
+        await sleep(roundDelay);
+    }
+};
+
+main().catch(e => {
+    if (e instanceof Error) {
+        console.error(`Fatal error:`, e.message);
+    } else {
+        console.error(`Fatal error:`, String(e));
+    }
+});
